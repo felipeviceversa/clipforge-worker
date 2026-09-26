@@ -1,0 +1,100 @@
+name: Process ClipForge video
+run-name: ClipForge ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id: { description: Job ID, required: true, type: string }
+      project_id: { description: Project ID, required: true, type: string }
+      workspace_id: { description: Workspace ID, required: true, type: string }
+      source_type: { description: Source type, required: true, type: string }
+      source_url: { description: Source URL, required: true, type: string }
+      language: { description: Language, required: true, default: pt-BR, type: string }
+      prompt: { description: Curation prompt, required: false, type: string }
+      settings: { description: JSON settings, required: false, default: '{}', type: string }
+      callback_url: { description: Skip callback, required: true, type: string }
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clipforge-worker
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mask source URL
+        run: echo "::add-mask::${{ inputs.source_url }}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg unzip
+          pip install -r requirements.txt
+      - name: Cache Vosk model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/vosk-model-small-pt-0.3
+          key: vosk-small-pt-0.3
+      - name: Download Vosk model
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          curl -L --retry 3 -o /tmp/model.zip https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip
+          unzip -q /tmp/model.zip -d models
+      - name: Process video
+        env:
+          DATA_DIR: ${{ runner.temp }}/clipforge
+          MODEL_DIR: ${{ github.workspace }}/models/vosk-model-small-pt-0.3
+          CALLBACK_ENABLED: 'true'
+          DEFER_READY_CALLBACK: 'true'
+          WORKER_WEBHOOK_SECRET: ${{ secrets.WORKER_WEBHOOK_SECRET }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          PUBLIC_FILE_PREFIX: https://github.com/${{ github.repository }}/releases/download/job-${{ inputs.job_id }}
+          GITHUB_OUTPUT_JSON: ${{ runner.temp }}/job-result.json
+        run: |
+          python action_runner.py \
+            --job-id '${{ inputs.job_id }}' \
+            --project-id '${{ inputs.project_id }}' \
+            --workspace-id '${{ inputs.workspace_id }}' \
+            --source-type '${{ inputs.source_type }}' \
+            --source-url '${{ inputs.source_url }}' \
+            --language '${{ inputs.language }}' \
+            --prompt '${{ inputs.prompt }}' \
+            --settings '${{ inputs.settings }}' \
+            --callback-url '${{ inputs.callback_url }}'
+      - name: Publish temporary previews
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          GH_TOKEN: ${{ github.token }}
+          JOB_ID: ${{ inputs.job_id }}
+          DATA_DIR: ${{ runner.temp }}/clipforge
+        run: |
+          if [ -n "${R2_BUCKET}" ]; then
+            echo "R2 configured; skipping public GitHub Release."
+            exit 0
+          fi
+          gh release delete "job-${JOB_ID}" --cleanup-tag -y 2>/dev/null || true
+          gh release create "job-${JOB_ID}" \
+            "${DATA_DIR}/${JOB_ID}"/preview_*.mp4 \
+            "${DATA_DIR}/${JOB_ID}"/transcript.json \
+            "${DATA_DIR}/${JOB_ID}"/clips.json \
+            --title "ClipForge ${JOB_ID}" \
+            --notes "Resultado temporário do pipeline ClipForge."
+      - name: Notify ready
+        env:
+          GITHUB_OUTPUT_JSON: ${{ runner.temp }}/job-result.json
+          WORKER_WEBHOOK_SECRET: ${{ secrets.WORKER_WEBHOOK_SECRET }}
+        run: python send_ready.py

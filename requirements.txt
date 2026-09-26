@@ -1,0 +1,8 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+httpx==0.28.1
+pydantic==2.11.7
+vosk==0.3.45
+python-multipart==0.0.20
+yt-dlp==2026.8.19
+boto3==1.40.40
